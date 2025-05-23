@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -89,12 +90,17 @@ func New(sess *session.Session, options ...Option) *Manager {
 
 // Sync syncs the files between s3 and local disks.
 func (m *Manager) Sync(source, dest string) error {
-	return m.SyncWithContext(context.Background(), source, dest)
+	return m.SyncWithContext(context.Background(), source, dest, nil)
+}
+
+// Sync syncs the files between s3 and local disks, checking if they match the provided patterns
+func (m *Manager) SyncWithPatterns(source, dest string, patterns []*regexp.Regexp) error {
+	return m.SyncWithContext(context.Background(), source, dest, patterns)
 }
 
 // SyncWithContext syncs the files between s3 and local disks.
 // The context will be used for operation cancellation.
-func (m *Manager) SyncWithContext(ctx context.Context, source, dest string) error {
+func (m *Manager) SyncWithContext(ctx context.Context, source, dest string, patterns []*regexp.Regexp) error {
 	sourceURL, err := url.Parse(source)
 	if err != nil {
 		return err
@@ -134,9 +140,9 @@ func (m *Manager) SyncWithContext(ctx context.Context, source, dest string) erro
 			if err != nil {
 				return err
 			}
-			return m.syncS3ToS3(ctx, chJob, sourceS3Path, destS3Path)
+			return m.syncS3ToS3(ctx, chJob, sourceS3Path, destS3Path, patterns)
 		}
-		return m.syncS3ToLocal(ctx, chJob, sourceS3Path, dest)
+		return m.syncS3ToLocal(ctx, chJob, sourceS3Path, dest, patterns)
 	}
 
 	if isS3URL(destURL) {
@@ -144,7 +150,7 @@ func (m *Manager) SyncWithContext(ctx context.Context, source, dest string) erro
 		if err != nil {
 			return err
 		}
-		return m.syncLocalToS3(ctx, chJob, source, destS3Path)
+		return m.syncLocalToS3(ctx, chJob, source, destS3Path, patterns)
 	}
 
 	return errors.New("local to local sync is not supported")
@@ -161,11 +167,11 @@ func isS3URL(url *url.URL) bool {
 	return url.Scheme == "s3"
 }
 
-func (m *Manager) syncS3ToS3(ctx context.Context, chJob chan func(), sourcePath *s3Path, destPath *s3Path) error {
+func (m *Manager) syncS3ToS3(ctx context.Context, chJob chan func(), sourcePath *s3Path, destPath *s3Path, patterns []*regexp.Regexp) error {
 	wg := &sync.WaitGroup{}
 	errs := &multiErr{}
 	for source := range filterFilesForSync(
-		m.listS3Files(ctx, sourcePath), m.listS3Files(ctx, destPath), m.del,
+		m.listS3Files(ctx, sourcePath, patterns), m.listS3Files(ctx, destPath, patterns), m.del,
 	) {
 		wg.Add(1)
 		source := source
@@ -189,11 +195,11 @@ func (m *Manager) syncS3ToS3(ctx context.Context, chJob chan func(), sourcePath 
 
 }
 
-func (m *Manager) syncLocalToS3(ctx context.Context, chJob chan func(), sourcePath string, destPath *s3Path) error {
+func (m *Manager) syncLocalToS3(ctx context.Context, chJob chan func(), sourcePath string, destPath *s3Path, patterns []*regexp.Regexp) error {
 	wg := &sync.WaitGroup{}
 	errs := &multiErr{}
 	for source := range filterFilesForSync(
-		listLocalFiles(ctx, sourcePath), m.listS3Files(ctx, destPath), m.del,
+		listLocalFiles(ctx, sourcePath, patterns), m.listS3Files(ctx, destPath, patterns), m.del,
 	) {
 		wg.Add(1)
 		source := source
@@ -221,11 +227,13 @@ func (m *Manager) syncLocalToS3(ctx context.Context, chJob chan func(), sourcePa
 }
 
 // syncS3ToLocal syncs the given s3 path to the given local path.
-func (m *Manager) syncS3ToLocal(ctx context.Context, chJob chan func(), sourcePath *s3Path, destPath string) error {
+func (m *Manager) syncS3ToLocal(
+	ctx context.Context, chJob chan func(), sourcePath *s3Path, destPath string, patterns []*regexp.Regexp,
+) error {
 	wg := &sync.WaitGroup{}
 	errs := &multiErr{}
 	for source := range filterFilesForSync(
-		m.listS3Files(ctx, sourcePath), listLocalFiles(ctx, destPath), m.del,
+		m.listS3Files(ctx, sourcePath, patterns), listLocalFiles(ctx, destPath, patterns), m.del,
 	) {
 		wg.Add(1)
 		source := source
@@ -429,14 +437,14 @@ func (m *Manager) deleteRemote(file *fileInfo, destPath *s3Path) error {
 }
 
 // listS3Files return a channel which receives the file infos under the given s3Path.
-func (m *Manager) listS3Files(ctx context.Context, path *s3Path) chan *fileInfo {
+func (m *Manager) listS3Files(ctx context.Context, path *s3Path, patterns []*regexp.Regexp) chan *fileInfo {
 	c := make(chan *fileInfo, 50000) // TODO: revisit this buffer size later
 
 	go func() {
 		defer close(c)
 		var token *string
 		for {
-			if token = m.listS3FileWithToken(ctx, c, path, token); token == nil {
+			if token = m.listS3FileWithToken(ctx, c, path, token, patterns); token == nil {
 				break
 			}
 		}
@@ -446,7 +454,7 @@ func (m *Manager) listS3Files(ctx context.Context, path *s3Path) chan *fileInfo 
 }
 
 // listS3FileWithToken lists (send to the result channel) the s3 files from the given continuation token.
-func (m *Manager) listS3FileWithToken(ctx context.Context, c chan *fileInfo, path *s3Path, token *string) *string {
+func (m *Manager) listS3FileWithToken(ctx context.Context, c chan *fileInfo, path *s3Path, token *string, patterns []*regexp.Regexp) *string {
 	list, err := m.s3.ListObjectsV2(&s3.ListObjectsV2Input{
 		Bucket:            &path.bucket,
 		Prefix:            &path.bucketPrefix,
@@ -465,6 +473,9 @@ func (m *Manager) listS3FileWithToken(ctx context.Context, c chan *fileInfo, pat
 		name, err := filepath.Rel(path.bucketPrefix, *object.Key)
 		if err != nil {
 			sendErrorInfoToChannel(ctx, c, err)
+			continue
+		}
+		if !matchName(name, patterns) {
 			continue
 		}
 		var fi *fileInfo
@@ -512,7 +523,7 @@ func (m *Manager) incrementDeletedFiles() {
 
 // listLocalFiles returns a channel which receives the infos of the files under the given basePath.
 // basePath have to be absolute path.
-func listLocalFiles(ctx context.Context, basePath string) chan *fileInfo {
+func listLocalFiles(ctx context.Context, basePath string, patterns []*regexp.Regexp) chan *fileInfo {
 	c := make(chan *fileInfo)
 
 	basePath = filepath.ToSlash(basePath)
@@ -540,6 +551,9 @@ func listLocalFiles(ctx context.Context, basePath string) chan *fileInfo {
 		err = filepath.Walk(basePath, func(path string, stat os.FileInfo, err error) error {
 			if err != nil {
 				return err
+			}
+			if !matchName(path, patterns) {
+				return ctx.Err()
 			}
 			sendFileInfoToChannel(ctx, c, basePath, path, stat, false)
 			return ctx.Err()
@@ -632,4 +646,16 @@ func fileInfoChanToMap(files chan *fileInfo) (map[string]*fileInfo, error) {
 		result[file.name] = file
 	}
 	return result, nil
+}
+
+func matchName(name string, patterns []*regexp.Regexp) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, pattern := range patterns {
+		if pattern.MatchString(name) {
+			return true
+		}
+	}
+	return false
 }

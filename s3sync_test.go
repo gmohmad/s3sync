@@ -765,7 +765,7 @@ func TestListLocalFiles(t *testing.T) {
 	}
 
 	t.Run("Root", func(t *testing.T) {
-		paths := collectFilePaths(listLocalFiles(context.Background(), temp))
+		paths := collectFilePaths(listLocalFiles(context.Background(), temp, nil))
 		expected := []string{
 			filepath.Join(temp, "bar", "baz", "test3"),
 			filepath.Join(temp, "foo", "test2"),
@@ -777,7 +777,7 @@ func TestListLocalFiles(t *testing.T) {
 	})
 
 	t.Run("EmptyDir", func(t *testing.T) {
-		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "empty")))
+		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "empty"), nil))
 		expected := []string{}
 		if !reflect.DeepEqual(expected, paths) {
 			t.Errorf("Local file list is expected to be %v, got %v", expected, paths)
@@ -785,7 +785,7 @@ func TestListLocalFiles(t *testing.T) {
 	})
 
 	t.Run("File", func(t *testing.T) {
-		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "test1")))
+		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "test1"), nil))
 		expected := []string{
 			filepath.Join(temp, "test1"),
 		}
@@ -795,7 +795,7 @@ func TestListLocalFiles(t *testing.T) {
 	})
 
 	t.Run("Dir", func(t *testing.T) {
-		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "foo")))
+		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "foo"), nil))
 		expected := []string{
 			filepath.Join(temp, "foo", "test2"),
 		}
@@ -805,7 +805,7 @@ func TestListLocalFiles(t *testing.T) {
 	})
 
 	t.Run("Dir2", func(t *testing.T) {
-		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "bar")))
+		paths := collectFilePaths(listLocalFiles(context.Background(), filepath.Join(temp, "bar"), nil))
 		expected := []string{
 			filepath.Join(temp, "bar", "baz", "test3"),
 		}
