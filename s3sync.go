@@ -89,26 +89,34 @@ func New(sess *session.Session, options ...Option) *Manager {
 }
 
 // Sync syncs the files between s3 and local disks.
-func (m *Manager) Sync(source, dest string) error {
-	return m.SyncWithContext(context.Background(), source, dest, nil)
+func (m *Manager) Sync(ctx context.Context, source, dest string) error {
+	_, err := m.sync(ctx, source, dest, nil)
+	return err
 }
 
 // Sync syncs the files between s3 and local disks, checking if they match the provided patterns
-func (m *Manager) SyncWithPatterns(source, dest string, patterns []*regexp.Regexp) error {
-	return m.SyncWithContext(context.Background(), source, dest, patterns)
+func (m *Manager) SyncWithPatterns(ctx context.Context, source, dest string, patterns []*regexp.Regexp) error {
+	_, err := m.sync(ctx, source, dest, patterns)
+	return err
+}
+
+// Sync syncs the files between s3 and local disks, and returns if anything file has changed (not including deletions)
+// Only works for syncing files from s3 to local. will always return false for other operations.
+func (m *Manager) SyncWithIsChanged(ctx context.Context, source, dest string) (bool, error) {
+	return m.sync(ctx, source, dest, []*regexp.Regexp{})
 }
 
 // SyncWithContext syncs the files between s3 and local disks.
 // The context will be used for operation cancellation.
-func (m *Manager) SyncWithContext(ctx context.Context, source, dest string, patterns []*regexp.Regexp) error {
+func (m *Manager) sync(ctx context.Context, source, dest string, patterns []*regexp.Regexp) (bool, error) {
 	sourceURL, err := url.Parse(source)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	destURL, err := url.Parse(dest)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -133,14 +141,14 @@ func (m *Manager) SyncWithContext(ctx context.Context, source, dest string, patt
 	if isS3URL(sourceURL) {
 		sourceS3Path, err := urlToS3Path(sourceURL)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if isS3URL(destURL) {
 			destS3Path, err := urlToS3Path(destURL)
 			if err != nil {
-				return err
+				return false, err
 			}
-			return m.syncS3ToS3(ctx, chJob, sourceS3Path, destS3Path, patterns)
+			return false, m.syncS3ToS3(ctx, chJob, sourceS3Path, destS3Path, patterns)
 		}
 		return m.syncS3ToLocal(ctx, chJob, sourceS3Path, dest, patterns)
 	}
@@ -148,12 +156,12 @@ func (m *Manager) SyncWithContext(ctx context.Context, source, dest string, patt
 	if isS3URL(destURL) {
 		destS3Path, err := urlToS3Path(destURL)
 		if err != nil {
-			return err
+			return false, err
 		}
-		return m.syncLocalToS3(ctx, chJob, source, destS3Path, patterns)
+		return false, m.syncLocalToS3(ctx, chJob, source, destS3Path, patterns)
 	}
 
-	return errors.New("local to local sync is not supported")
+	return false, errors.New("local to local sync is not supported")
 }
 
 // GetStatistics returns the structure that contains the sync statistics
@@ -198,6 +206,7 @@ func (m *Manager) syncS3ToS3(ctx context.Context, chJob chan func(), sourcePath 
 func (m *Manager) syncLocalToS3(ctx context.Context, chJob chan func(), sourcePath string, destPath *s3Path, patterns []*regexp.Regexp) error {
 	wg := &sync.WaitGroup{}
 	errs := &multiErr{}
+
 	for source := range filterFilesForSync(
 		listLocalFiles(ctx, sourcePath, patterns), m.listS3Files(ctx, destPath, patterns), m.del,
 	) {
@@ -229,9 +238,11 @@ func (m *Manager) syncLocalToS3(ctx context.Context, chJob chan func(), sourcePa
 // syncS3ToLocal syncs the given s3 path to the given local path.
 func (m *Manager) syncS3ToLocal(
 	ctx context.Context, chJob chan func(), sourcePath *s3Path, destPath string, patterns []*regexp.Regexp,
-) error {
+) (bool, error) {
 	wg := &sync.WaitGroup{}
 	errs := &multiErr{}
+
+	changed := false
 	for source := range filterFilesForSync(
 		m.listS3Files(ctx, sourcePath, patterns), listLocalFiles(ctx, destPath, patterns), m.del,
 	) {
@@ -245,6 +256,7 @@ func (m *Manager) syncS3ToLocal(
 			}
 			switch source.op {
 			case opUpdate:
+				changed = true
 				if err := m.download(source.fileInfo, sourcePath, destPath); err != nil {
 					errs.Append(err)
 				}
@@ -257,7 +269,7 @@ func (m *Manager) syncS3ToLocal(
 	}
 	wg.Wait()
 
-	return errs.ErrOrNil()
+	return changed, errs.ErrOrNil()
 }
 
 func (m *Manager) copyS3ToS3(ctx context.Context, file *fileInfo, sourcePath *s3Path, destPath *s3Path) error {
